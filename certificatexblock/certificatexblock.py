@@ -1,0 +1,219 @@
+# -*- coding: utf-8 -*-
+import logging
+import os
+import pkg_resources
+from django.template import Context
+
+from xblock.core import XBlock
+from xblock.fields import Scope, String, Boolean
+from xblock.fragment import Fragment
+from xblockutils.resources import ResourceLoader
+
+from webob import Response
+
+from django.urls import reverse
+from django.utils.translation import gettext_lazy as _
+from django.contrib.auth.models import User
+from django.conf import settings
+from django.template import Context, Template
+from xmodule.modulestore.django import modulestore
+from opaque_keys.edx.keys import CourseKey
+
+from lms.djangoapps.certificates import api as certs_api
+from lms.djangoapps.certificates.utils import _certificate_download_url
+from common.djangoapps.student.models import CourseEnrollment
+from lms.djangoapps.certificates.models import GeneratedCertificate
+from lms.djangoapps.grades.api import CourseGradeFactory
+
+log = logging.getLogger("cetificatexblock")
+
+
+@XBlock.needs("i18n")  # pylint: disable=too-many-ancestors
+class CertificateXBlock(XBlock):
+    """
+    TO-DO: document what your XBlock does.
+    """
+
+    loader = ResourceLoader(__name__)
+
+    # Icon of the XBlock. Values : [other (default), video, problem]
+
+    icon_class = "problem"
+    # Fields are defined on the class.  You can access them in your code as
+    # self.<fieldname>.
+
+    display_name = String(
+        display_name=_("Display Name"),
+        default="Certificate",
+        scope=Scope.settings,
+        help="The display name for this component.",
+    )
+
+    send_email = Boolean(
+        display_name=_("Send Cetificate link email"),
+        default=False,
+        scope=Scope.settings,
+        help="Select True if you want to send certificate link into email.",
+    )
+
+    def load_resource(self, resource_path):  # pylint: disable=no-self-use
+        """
+        Gets the content of a resource
+        """
+
+        resource_content = pkg_resources.resource_string(__name__, resource_path)
+        return resource_content.decode("utf-8")
+
+    def render_template(self, template_path, context={}):
+        """
+        Evaluate a template by resource path, applying the provided context
+        """
+        template_str = self.load_resource(template_path)
+        return Template(template_str).render(Context(context))
+
+    @XBlock.json_handler
+    def studio_submit(self, data, suffix=""):
+        """
+        Called when submitting the form in Studio.
+        """
+        self.display_name = data.get("display_name")
+        enable_email = data.get("enable_email")
+        self.send_email = True if enable_email == "True" else False
+        return {"result": "success"}
+
+    def studio_view(self, context=None):
+        """
+        The secondary view of the XBlock, shown to teachers
+        when editing the XBlock.
+        """
+
+        context = {
+            "display_name": self.display_name,
+            "enable_email": self.send_email,
+        }
+        html = self.render_template("static/html/certificatexblock_edit.html", context)
+
+        frag = Fragment(html)
+        frag.add_javascript(
+            self.load_resource("static/js/src/certificatexblock_edit.js")
+        )
+        frag.add_css(self.load_resource("static/css/certificatexblock_edit.css"))
+        frag.initialize_js("CertificateXBlockEdit")
+        return frag
+
+    def student_view(self, context=None):
+        """
+        The primary view of the XBlock, shown to students
+        when viewing courses.
+        """
+        enable_submit_button = True
+        student = User.objects.get(pk=self.runtime.user_id)
+        try:
+            certificate_status = certs_api.certificate_downloadable_status(
+                student, self.runtime.course_id
+            )
+            if certificate_status["is_downloadable"]:
+                enable_submit_button = False
+        except Exception as e:
+            log.info(str(e))
+        context = {
+            "display_name": self.display_name,
+            "enable_submit_button": enable_submit_button,
+        }
+        html = self.render_template("static/html/certificatexblock.html", context)
+        frag = Fragment(html)
+        frag.add_css(self.load_resource("static/css/certificatexblock.css"))
+        frag.add_javascript(self.load_resource("static/js/src/certificatexblock.js"))
+        frag.initialize_js("CertificateXBlock")
+        return frag
+
+    # TO-DO: change this handler to perform your own actions.  You may need more
+    # than one handler, or you may not need any handlers at all.
+    @XBlock.handler
+    def generate_certificate(self, data, suffix=""):
+        from lms.djangoapps.courseware.views.views import get_cert_data
+
+        is_cert_available = False
+        cert_redirect_url = ""
+        student = User.objects.get(pk=self.runtime.user_id)
+        course_key = self.runtime.course_id
+        course = modulestore().get_course(course_key, depth=2)
+        enrollment_mode, _ = CourseEnrollment.enrollment_mode_for_user(
+            student, course_key
+        )
+        course_grade = CourseGradeFactory().read(student, course)
+        certificate_data = get_cert_data(student, course, enrollment_mode, course_grade)
+        if certificate_data:
+            certificate_status = certs_api.certificate_downloadable_status(
+                student, course.id
+            )
+            if certificate_status["is_downloadable"]:
+                is_cert_available = True
+                cert_redirect_url = (
+                    settings.LMS_ROOT_URL + certificate_status["download_url"]
+                )
+                message = "Die Teilnahmebescheinigung ist bereits erstellt worden. ┃ The certificate has already been created."
+            elif certificate_status["is_generating"]:
+                message = "Die Teilnahmebescheinigung wird erstellt ┃ Certificate is being created."
+            else:
+                certs_api.generate_certificate_task(student, course.id, "self")
+                is_cert_available = True
+                user_certificate = GeneratedCertificate.eligible_certificates.get(
+                    user=student.id, course_id=course_key
+                )
+                cert_redirect_url = settings.LMS_ROOT_URL + reverse(
+                    "certificates:render_cert_by_uuid",
+                    kwargs={"certificate_uuid": user_certificate.verify_uuid},
+                )
+                message = "Herzlichen Glückwunsch! Sie haben den Kurs erfolgreich abgeschlossen. ┃ Congratulations! You have successfully completed the training course."
+                # if self.send_email:
+                #     self.send_certificate_email(student, cert_redirect_url, course)
+
+        else:
+            message = "Die Teilnahmebescheinigung konnte nicht ausgestellt werden. Sie haben die erforderliche Punktzahl nicht erreicht. Bitte stellen Sie sicher, dass Sie alle Testfragen beantwortet haben.┃ The certificate was not issued. You have not reached the required score. Please make sure you have answered all test questions."
+
+        return Response(
+            json_body={
+                "is_cert_available": is_cert_available,
+                "cert_redirect_url": cert_redirect_url,
+                "message": message,
+            }
+        )
+
+    def send_certificate_email(self, student, cert_redirect_url, course):
+        from student.tasks import send_activation_email
+
+        context = {
+            "username": student.profile.name or student.username,
+            "course_name": course.display_name,
+            "cert_link": cert_redirect_url,
+            "platform_name": settings.PLATFORM_NAME,
+        }
+        message = self.render_template("static/email/certificate_email.txt", context)
+        subject = "Congratulations!, You earned course certificate."
+        send_activation_email.delay(
+            subject, message, settings.DEFAULT_FROM_EMAIL, student.email
+        )
+
+    # TO-DO: change this to create the scenarios you'd like to see in the
+    # workbench while developing your XBlock.
+
+    @staticmethod
+    def workbench_scenarios():
+        """A canned scenario for display in the workbench."""
+        return [
+            (
+                "CertificateXBlock",
+                """<certificatexblock/>
+             """,
+            ),
+            (
+                "Multiple CertificateXBlock",
+                """<vertical_demo>
+                <certificatexblock/>
+                <certificatexblock/>
+                <certificatexblock/>
+                </vertical_demo>
+             """,
+            ),
+        ]
